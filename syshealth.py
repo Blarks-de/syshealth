@@ -10,8 +10,17 @@ syshealth.py — System-Gesundheitscheck
 
 Abhängigkeiten:
   pip install psutil
-  Linux: smartmontools installiert (smartctl)
-  Windows: smartmontools für Windows oder CrystalDiskInfo CLI
+  
+  Linux: 
+    - smartmontools (smartctl)
+    - lm-sensors (für CPU-Temperaturen)
+  
+  Windows: 
+    - smartmontools für Windows oder CrystalDiskInfo CLI
+  
+  macOS:
+    - smartmontools (via Homebrew: brew install smartmontools)
+    - osx-cpu-temp (optional, für CPU-Temperaturen: brew install osx-cpu-temp)
 """
 
 import subprocess
@@ -21,6 +30,7 @@ import os
 import json
 import re
 from datetime import datetime, timedelta
+from typing import Tuple, List, Optional
 
 try:
     import psutil
@@ -31,11 +41,12 @@ except ImportError:
 SYSTEM = platform.system().lower()
 IS_WINDOWS = SYSTEM == "windows"
 IS_LINUX   = SYSTEM == "linux"
+IS_MACOS   = SYSTEM == "darwin"
 
 SEP = "─" * 60
 
 
-def run(cmd: list, timeout: int = 10) -> tuple[int, str, str]:
+def run(cmd: list, timeout: int = 10) -> Tuple[int, str, str]:
     """Führt einen Befehl aus, gibt (returncode, stdout, stderr) zurück.
     Auf Windows wird die OEM-Codepage (GetOEMCP) verwendet — sonst UTF-8."""
     if IS_WINDOWS:
@@ -85,7 +96,7 @@ def header(title: str):
 # ─────────────────────────────────────────────
 # 1. VM-ERKENNUNG
 # ─────────────────────────────────────────────
-def detect_vm() -> tuple[bool, str]:
+def detect_vm() -> Tuple[bool, str]:
     """Gibt (is_vm, grund) zurück."""
     hints = []
 
@@ -142,6 +153,36 @@ def detect_vm() -> tuple[bool, str]:
             for kw in vm_keywords:
                 if kw in out.lower():
                     hints.append(f"CimInstance: {out.strip()[:80]}")
+                    break
+
+    elif IS_MACOS:
+        # system_profiler für Hardware-Info
+        rc, out, _ = run(["system_profiler", "SPHardwareDataType"], timeout=15)
+        if rc == 0:
+            vm_keywords = ["vmware", "virtualbox", "parallels", "virtual", "qemu", "utm"]
+            for kw in vm_keywords:
+                if kw in out.lower():
+                    # Extrahiere relevante Zeile
+                    for line in out.splitlines():
+                        if "model" in line.lower() and kw in line.lower():
+                            hints.append(f"Hardware: {line.strip()[:80]}")
+                            break
+                    if not hints:
+                        hints.append(f"system_profiler: VM-Keyword '{kw}' gefunden")
+                    break
+        
+        # sysctl für Hypervisor-Check (funktioniert bei manchen VMs)
+        rc, out, _ = run(["sysctl", "-n", "machdep.cpu.features"])
+        if rc == 0 and "hypervisor" in out.lower():
+            hints.append("sysctl: Hypervisor-Feature erkannt")
+        
+        # ioreg für VM-spezifische Geräte
+        rc, out, _ = run(["ioreg", "-l"], timeout=10)
+        if rc == 0:
+            vm_devices = ["VMware", "VirtualBox", "Parallels", "QEMU"]
+            for dev in vm_devices:
+                if dev in out:
+                    hints.append(f"ioreg: {dev}-Device gefunden")
                     break
 
     if hints:
@@ -201,7 +242,7 @@ def check_ram():
 # ─────────────────────────────────────────────
 # 3. SMART (HDD/SSD) + NVMe
 # ─────────────────────────────────────────────
-def get_block_devices() -> list[str]:
+def get_block_devices() -> List[str]:
     """Gibt eine Liste von Blockgeräten zurück."""
     devices = []
     if IS_LINUX:
@@ -226,6 +267,15 @@ def get_block_devices() -> list[str]:
                     dev = line.split("=", 1)[-1].strip()
                     if dev:
                         devices.append(dev)
+    elif IS_MACOS:
+        # diskutil list gibt alle Disks aus
+        rc, out, _ = run(["diskutil", "list"])
+        if rc == 0:
+            for line in out.splitlines():
+                # Zeilen wie "/dev/disk0" oder "/dev/disk1 (internal, physical)"
+                match = re.match(r"^(/dev/disk\d+)\s+\(.*physical.*\)", line)
+                if match:
+                    devices.append(match.group(1))
     return devices
 
 
@@ -284,7 +334,7 @@ def check_smart_windows_native():
                 print(f"    {ls}{wear_warn}")
 
 
-def parse_smart_overall(output: str) -> tuple[str, str]:
+def parse_smart_overall(output: str) -> Tuple[str, str]:
     """Extrahiert SMART-Gesamturteil."""
     for line in output.splitlines():
         if "SMART overall-health" in line or "SMART Health Status" in line:
@@ -307,7 +357,7 @@ SMART_THRESHOLDS = {
 }
 
 
-def parse_smart_attrs(output: str) -> list[dict]:
+def parse_smart_attrs(output: str) -> List[dict]:
     """Parst kritische SMART-Attribute mit Schwellwerten."""
     results = []
     for line in output.splitlines():
@@ -467,6 +517,65 @@ def check_smart():
                 check_nvme_details(dev, out, dtype)
         return  # Windows-Pfad abgeschlossen
 
+    # macOS-Pfad
+    if IS_MACOS:
+        devices = get_block_devices()
+        if not devices:
+            print("  Keine Blockgeräte gefunden.")
+            return
+
+        for dev in devices:
+            print(f"\n  Gerät: {dev}")
+            
+            # diskutil info für grundlegende Infos
+            rc_di, out_di, _ = run(["diskutil", "info", dev])
+            if rc_di == 0:
+                model = serial = ""
+                for line in out_di.splitlines():
+                    if "Device / Media Name:" in line:
+                        model = line.split(":", 1)[-1].strip()
+                    elif "Disk Size:" in line:
+                        size = line.split(":", 1)[-1].strip()
+                        print(f"    📦  {model or dev}  |  Größe: {size}")
+                        break
+            
+            # Versuche smartctl (wenn via Homebrew installiert)
+            rc, out, err = run(["smartctl", "-H", "-A", dev], timeout=20)
+            
+            if rc == -1 or "command not found" in err.lower():
+                # Kein smartctl → nutze diskutil verifyDisk als Fallback
+                print(f"    ⚠️  smartctl nicht verfügbar (installiere mit: brew install smartmontools)")
+                rc_v, out_v, _ = run(["diskutil", "verifyDisk", dev])
+                if rc_v == 0 and "appears to be OK" in out_v:
+                    print(f"    ✅  Disk Verification: OK (kein vollständiger SMART-Check)")
+                elif rc_v == 0:
+                    print(f"    ⚠️  Disk Verification: {out_v.strip()[:100]}")
+                continue
+            
+            # smartctl verfügbar
+            overall, _ = parse_smart_overall(out)
+            print(f"    Gesundheit: {overall}")
+            
+            attrs = parse_smart_attrs(out)
+            if attrs:
+                crits = [a for a in attrs if a["level"] == "crit"]
+                warns = [a for a in attrs if a["level"] == "warn"]
+                if crits:
+                    print("    ❌  KRITISCH — Platte möglicherweise am Sterben!")
+                    for a in crits:
+                        print(f"       [{a['id']:>3}] {a['name']:<28}: {a['raw']:>6}  ← SEHR HOCH")
+                if warns:
+                    print("    ⚠️   Erhöhte Werte:")
+                    for a in warns:
+                        print(f"       [{a['id']:>3}] {a['name']:<28}: {a['raw']:>6}")
+                if not crits and not warns:
+                    print("    ✅  Alle kritischen Attribute unauffällig")
+            
+            # NVMe auf macOS (oft über Apple Silicon oder Thunderbolt)
+            if "nvme" in out.lower() or "apple" in out.lower():
+                check_nvme_details(dev, out)
+        return  # macOS-Pfad abgeschlossen
+
     # Linux-Pfad
     devices = get_block_devices()
     if not devices:
@@ -574,6 +683,16 @@ def check_cpu():
                         break
         except OSError:
             pass
+    elif not cpu_model and IS_MACOS:
+        # macOS: sysctl für CPU-Modell
+        rc, out, _ = run(["sysctl", "-n", "machdep.cpu.brand_string"])
+        if rc == 0 and out.strip() and out.strip() != "arm":
+            cpu_model = out.strip()
+        else:
+            # Fallback für Apple Silicon: hw.model
+            rc2, out2, _ = run(["sysctl", "-n", "hw.model"])
+            if rc2 == 0 and out2.strip():
+                cpu_model = out2.strip()
     print(f"  Modell    : {cpu_model or 'Unbekannt'}")
     print(f"  Kerne     : {psutil.cpu_count(logical=False)} physisch / "
           f"{psutil.cpu_count(logical=True)} logisch")
@@ -602,8 +721,32 @@ def check_cpu():
                         warn = "⚠️ " if r.current > 80 else ("❌" if r.current > 95 else "")
                         label = f"{chip}/{r.label}" if r.label else chip
                         print(f"    {label:<30}: {r.current:.0f}°C  {warn}")
+        elif IS_MACOS:
+            # macOS: Versuche osx-cpu-temp (mehrere Pfade, da sudo anderen PATH hat)
+            temp_found = False
+            for cmd in [
+                "osx-cpu-temp",                    # Im PATH
+                "/opt/homebrew/bin/osx-cpu-temp",  # Homebrew auf Apple Silicon
+                "/usr/local/bin/osx-cpu-temp"      # Homebrew auf Intel
+            ]:
+                rc, out, _ = run([cmd, "-c"])
+                if rc == 0 and out.strip():
+                    try:
+                        temp = float(out.strip())
+                        warn = "⚠️ " if temp > 80 else ("❌" if temp > 95 else "")
+                        print(f"  Temperaturen:")
+                        print(f"    CPU                           : {temp:.0f}°C  {warn}")
+                        temp_found = True
+                        break
+                    except ValueError:
+                        pass
+            if not temp_found:
+                print(f"  Temperaturen: nicht verfügbar (installiere 'osx-cpu-temp' via brew)")
     except (AttributeError, NotImplementedError):
-        print(f"  Temperaturen: nicht verfügbar (kein lm-sensors?)")
+        if IS_LINUX:
+            print(f"  Temperaturen: nicht verfügbar (kein lm-sensors?)")
+        elif IS_MACOS:
+            print(f"  Temperaturen: nicht verfügbar (installiere 'osx-cpu-temp' via brew)")
 
 
 # ─────────────────────────────────────────────
@@ -644,6 +787,90 @@ def get_windows_version() -> str:
         return ver_str
     except Exception:
         return f"{platform.system()} {platform.release()} {platform.version()}"
+
+
+def get_hardware_age() -> str:
+    """Ermittelt das Hardware-Alter (nur macOS via Serial Number)."""
+    if not IS_MACOS:
+        return ""
+    
+    try:
+        rc, out, _ = run(["system_profiler", "SPHardwareDataType"], timeout=10)
+        if rc != 0:
+            return ""
+        
+        serial = model_id = ""
+        for line in out.splitlines():
+            if "Serial Number" in line:
+                serial = line.split(":", 1)[1].strip()
+            elif "Model Identifier" in line:
+                model_id = line.split(":", 1)[1].strip()
+        
+        if not serial or not model_id:
+            return ""
+        
+        # Serial Number dekodieren
+        # Alte Format (vor 2021): 12 Zeichen, z.B. C02ABCDEFGH1
+        # Neue Format (ab 2021): 10 Zeichen, z.B. ABCD123456
+        production_year = production_info = ""
+        
+        if len(serial) == 12:
+            # Altes Format: Position 4-5 = Jahr/Woche
+            # Position 4: Jahr (9=2019, 0=2020, C=2012, D=2013, F=2014, G=2015, H=2016, J=2017, K=2018, L=2019, M=2020, N=2021, P=2022, Q=2023, R=2024, etc.)
+            year_code = serial[3]
+            week_code = serial[4]
+            year_map = {
+                'C': 2012, 'D': 2013, 'F': 2014, 'G': 2015, 'H': 2016,
+                'J': 2017, 'K': 2018, 'L': 2019, 'M': 2020, 'N': 2021,
+                'P': 2022, 'Q': 2023, 'R': 2024, 'S': 2025, 'T': 2026,
+                'V': 2027, 'W': 2028, 'X': 2029, 'Y': 2030, 'Z': 2031
+            }
+            if year_code in year_map:
+                production_year = str(year_map[year_code])
+                production_info = f"produziert ca. {production_year}"
+        elif len(serial) == 10:
+            # Neues Format (ab 2021): Position 4 = Jahr (halbjährlich)
+            # Die Codes starten bei C=2020 H2 und gehen alphabetisch weiter
+            # ABER: überspringt E, I, O, U (wie Vokale)
+            year_code = serial[3]
+            year_map_new = {
+                'C': '2020 H2', 'D': '2021 H1', 'F': '2021 H2', 'G': '2022 H1',
+                'H': '2022 H2', 'J': '2023 H1', 'K': '2023 H2', 'L': '2024 H1',
+                'M': '2024 H2', 'N': '2025 H1', 'P': '2025 H2', 'Q': '2026 H1',
+                'R': '2026 H2', 'S': '2027 H1', 'T': '2027 H2', 'V': '2028 H1',
+                'W': '2028 H2', 'X': '2029 H1', 'Y': '2029 H2', 'Z': '2030 H1'
+            }
+            if year_code in year_map_new:
+                production_info = f"produziert ca. {year_map_new[year_code]}"
+                production_year = year_map_new[year_code].split()[0]
+            else:
+                # Fallback: wenn Code unbekannt, einfach anzeigen
+                production_info = f"Seriennummer: {serial} (Code: {year_code} unbekannt)"
+        
+        # Alter berechnen
+        age_str = ""
+        if production_year:
+            try:
+                prod_year_int = int(production_year)
+                current_year = datetime.now().year
+                age = current_year - prod_year_int
+                if age == 0:
+                    age_str = " — <1 Jahr alt"
+                elif age == 1:
+                    age_str = " — ca. 1 Jahr alt"
+                else:
+                    age_str = f" — ca. {age} Jahre alt"
+            except ValueError:
+                pass
+        
+        result = f"{model_id}"
+        if production_info:
+            result += f" ({production_info}{age_str})"
+        
+        return result
+        
+    except Exception:
+        return ""
 
 
 def get_os_install_date() -> str:
@@ -715,7 +942,39 @@ def get_os_install_date() -> str:
             pass
 
         return "unbekannt"
-
+    
+    elif IS_MACOS:
+        # Methode 1: .AppleSetupDone = wann Setup-Assistent abgeschlossen wurde
+        try:
+            st = os.stat("/var/db/.AppleSetupDone")
+            return datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d") + "  (Setup-Assistent)"
+        except OSError:
+            pass
+        
+        # Methode 2: /var/log/install.log (ältester Eintrag)
+        try:
+            st = os.stat("/var/log/install.log")
+            return datetime.fromtimestamp(st.st_ctime).strftime("%Y-%m-%d") + "  (Install-Log)"
+        except OSError:
+            pass
+        
+        # Methode 3: älteste Systemdatei im Root
+        try:
+            oldest = None
+            for item in ["/private", "/System", "/Applications"]:
+                try:
+                    st = os.stat(item)
+                    if oldest is None or st.st_birthtime < oldest:
+                        oldest = st.st_birthtime
+                except (OSError, AttributeError):
+                    pass
+            if oldest:
+                return datetime.fromtimestamp(oldest).strftime("%Y-%m-%d") + "  (geschätzt)"
+        except Exception:
+            pass
+        
+        return "unbekannt"
+    
     return "unbekannt"
 
 
@@ -748,9 +1007,24 @@ def check_system_info():
     if shown_ips:
         print(f"  IP        : {' | '.join(shown_ips)}")
 
-    # OS-Version — Windows detailliert, Linux normal
+    # OS-Version — Windows detailliert, Linux normal, macOS mit sw_vers
     if IS_WINDOWS:
         print(f"  OS        : {get_windows_version()}")
+    elif IS_MACOS:
+        rc, out, _ = run(["sw_vers"])
+        if rc == 0:
+            # Ausgabe wie: "ProductName: macOS\nProductVersion: 14.2\n..."
+            version_info = {}
+            for line in out.splitlines():
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    version_info[k.strip()] = v.strip()
+            prod_name = version_info.get("ProductName", "macOS")
+            prod_ver = version_info.get("ProductVersion", "")
+            build = version_info.get("BuildVersion", "")
+            print(f"  OS        : {prod_name} {prod_ver} (Build: {build})")
+        else:
+            print(f"  OS        : macOS (sw_vers nicht verfügbar)")
     else:
         cpu_model_os = ""
         try:
@@ -764,6 +1038,13 @@ def check_system_info():
     print(f"  Architektur: {platform.machine()}")
     print(f"  Python    : {platform.python_version()}")
     print(f"  Installiert: {get_os_install_date()}")
+    
+    # Hardware-Alter (nur macOS)
+    if IS_MACOS:
+        hw_age = get_hardware_age()
+        if hw_age:
+            print(f"  Hardware  : {hw_age}")
+    
     print(f"  Boot-Zeit : {boot.strftime('%Y-%m-%d %H:%M')}")
     print(f"  Uptime    : {days}d {hours}h {minutes}m")
 
@@ -908,7 +1189,7 @@ def check_storage_extras():
 # ─────────────────────────────────────────────
 # 9. CRYPTO-TOOLS & MOUNTS
 # ─────────────────────────────────────────────
-def check_tool_present(name: str, version_args: list = None) -> tuple[bool, str]:
+def check_tool_present(name: str, version_args: list = None) -> Tuple[bool, str]:
     """Prüft ob ein Tool im PATH ist, gibt (vorhanden, version) zurück."""
     args = version_args or ["--version"]
     rc, out, err = run([name] + args)
@@ -1246,7 +1527,71 @@ def check_hardware():
                     print(f"    🖥️   {line}")
         else:
             print("    ⚠️  Keine Info verfügbar")
-def get_ntp_offset(server: str = "pool.ntp.org", timeout: int = 5) -> float | None:
+    
+    elif IS_MACOS:
+        # ── Netzwerkkarten ─────────────────────────
+        print("  Netzwerkkarten:")
+        rc, out, _ = run(["networksetup", "-listallhardwareports"], timeout=10)
+        if rc == 0 and out.strip():
+            current_port = None
+            current_device = None
+            for line in out.splitlines():
+                line = line.strip()
+                if line.startswith("Hardware Port:"):
+                    current_port = line.split(":", 1)[1].strip()
+                elif line.startswith("Device:"):
+                    current_device = line.split(":", 1)[1].strip()
+                    if current_port and current_device:
+                        # Hole MAC und Status
+                        rc_if, out_if, _ = run(["ifconfig", current_device])
+                        mac = status = ""
+                        if rc_if == 0:
+                            for ifline in out_if.splitlines():
+                                if "ether" in ifline:
+                                    mac = ifline.split()[1]
+                                elif "status:" in ifline:
+                                    status = ifline.split(":", 1)[1].strip()
+                        status_icon = "🟢" if status == "active" else "⚪"
+                        mac_str = f" | MAC: {mac}" if mac else ""
+                        print(f"    🌐  {current_port:<30} ({current_device}) {status_icon}{mac_str}")
+                        current_port = current_device = None
+        else:
+            # Fallback: ifconfig
+            rc2, out2, _ = run(["ifconfig"])
+            if rc2 == 0:
+                skip = re.compile(r"^(lo|gif|stf|ap|awdl|llw|utun|bridge)")
+                for line in out2.splitlines():
+                    if re.match(r"^\w+:", line):
+                        iface = line.split(":")[0]
+                        if not skip.match(iface):
+                            print(f"    🌐  {iface}")
+
+        # ── GPU via system_profiler ────────────────
+        print("\n  Grafikkarte(n):")
+        rc, out, _ = run(["system_profiler", "SPDisplaysDataType"], timeout=15)
+        if rc == 0 and out.strip():
+            gpu_name = vram = ""
+            for line in out.splitlines():
+                line = line.strip()
+                if "Chipset Model:" in line:
+                    gpu_name = line.split(":", 1)[1].strip()
+                elif "VRAM" in line or "Metal" in line:
+                    # Kann sein: "VRAM (Total): 8 GB" oder "Metal Family: Supported, Metal GPUFamily Apple 7"
+                    if ":" in line:
+                        vram = line.split(":", 1)[1].strip()
+                        if gpu_name and vram:
+                            # VRAM kann auch "Built-In" oder "Shared" sein
+                            print(f"    🖥️   {gpu_name}")
+                            if "GB" in vram or "MB" in vram:
+                                print(f"         VRAM: {vram}")
+                            gpu_name = vram = ""
+            # Falls noch ein GPU-Name übrig ist (z.B. letzte GPU ohne VRAM-Info)
+            if gpu_name:
+                print(f"    🖥️   {gpu_name}")
+        else:
+            print("    ⚠️  system_profiler fehlgeschlagen")
+
+def get_ntp_offset(server: str = "pool.ntp.org", timeout: int = 5) -> Optional[float]:
     """Fragt einen NTP-Server ab und gibt den Offset in Sekunden zurück."""
     import socket
     import struct
