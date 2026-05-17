@@ -59,3 +59,21 @@ MIT (oder was auch immer du willst — ist dein Code)
 ## Warum?
 
 Weil `htop` und Task-Manager nicht genug Nerd-Punkte geben.
+
+---
+
+## 🤖 AI-Generated Code
+
+**English:**  
+This project is 100% AI-generated code, created through prompt engineering with Claude (Anthropic). No manual coding was involved — just a human with ideas and an AI that doesn't need coffee breaks. Proof that good prompts beat good programmers. *"One good prompter achieves more than ten coders."*
+
+**Deutsch:**  
+Dieses Projekt ist zu 100% AI-generierter Code, entstanden durch Prompt-Engineering mit Claude (Anthropic). Kein manuelles Coding involviert — nur ein Mensch mit Ideen und eine KI, die keine Kaffeepausen braucht. Der Beweis, dass gute Prompts besser sind als gute Programmierer. *"Ein Antreiber schafft mehr wie 10 Arbeiter :-)"*
+
+### How It Was Made / Wie es entstand
+
+- **Prompt:** "Build me a system health monitoring tool for Linux and Windows"
+- **Claude:** *cracks knuckles* "Hold my tokens..."
+- **Result:** 1400+ lines of production-ready Python
+
+No Stack Overflow copy-paste. No trial-and-error debugging sessions at 3 AM. Just conversational programming. Welcome to 2025.
