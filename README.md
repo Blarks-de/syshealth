@@ -15,6 +15,8 @@ Ein umfassendes System-Monitoring-Tool für Linux, Windows und macOS.
 - **Hardware-Alter**: Produktionsdatum aus Serial Number (macOS) — wann wurde dein Mac gebaut?
 - **Verschlüsselung**: LUKS-Status und BitLocker (Windows)
 - **Zeitabgleich**: NTP-Offset, Zeitzone, Sync-Status
+- **Apple Time Machine**: Backup-Status über SMB-Share — wann war das letzte Backup, läuft es gerade, ist es intakt?
+- **Sicherheitscheck**: Warnt automatisch wenn `.env` nicht im `.gitignore` steht
 
 ## Installation
 
@@ -27,12 +29,45 @@ sudo apt install smartmontools lm-sensors  # Debian/Ubuntu
 sudo dnf install smartmontools lm_sensors  # Fedora/RHEL
 sudo pacman -S smartmontools lm_sensors    # Arch
 
+# Linux: cifs-utils für Time Machine SMB-Check
+sudo apt install cifs-utils   # Debian/Ubuntu
+sudo dnf install cifs-utils   # Fedora/RHEL
+sudo pacman -S cifs-utils     # Arch
+
 # macOS: Homebrew-Tools installieren
 brew install smartmontools      # Für SMART-Checks
 brew install osx-cpu-temp       # Optional: CPU-Temperaturen
 
 # Windows: smartmontools für Windows oder CrystalDiskInfo CLI
 ```
+
+## Time Machine Konfiguration
+
+Für den Backup-Check eine `.env` Datei **neben `syshealth.py`** anlegen:
+
+```ini
+TM_HOST=Dockfish          # Hostname oder IP deines NAS
+TM_SHARE=TimeMachine      # Name der SMB-Freigabe
+TM_USER=backup            # SMB-Benutzername
+TM_PASS=geheimesPasswort  # SMB-Passwort
+# TM_MACHINE=MeinMacBook  # Optional: filtert nach Maschinenname
+```
+
+> ⚠️ **Wichtig:** `.env` unbedingt in `.gitignore` eintragen!
+> ```bash
+> echo ".env" >> .gitignore
+> ```
+> syshealth.py warnt automatisch, wenn das vergessen wurde.
+
+Beispiel-Output:
+```
+  Status     : ✅  Intakt
+  Letztes    : 24. Mai 2026 14:00 Uhr  (3 Stunden alt)
+  Maschine   : MacBook-von-Mark
+  Ziel       : //Dockfish/TimeMachine
+```
+
+Auf **macOS** wird `tmutil` verwendet (kein Mount, kein Root nötig) — sofern Time Machine auf diesem Mac konfiguriert ist. Auf **Linux** wird der SMB-Share kurz gemountet (Root nötig, `cifs-utils` vorausgesetzt).
 
 ## Benutzung
 
@@ -54,6 +89,7 @@ python syshealth.py
 - **VM-Erkennung**: Erkennt Parallels, VMware Fusion, UTM, VirtualBox
 - **SMART via diskutil**: Fallback wenn smartmontools nicht installiert
 - **System-Info**: sw_vers für macOS-Version + Build-Nummer
+- **Time Machine**: Nutzt `tmutil` direkt — kein Mount, kein Root nötig
 
 ### Linux-Spezifisch
 - **Dirty Pages**: Warnung bei ungeschriebenem Cache (>2% RAM)
@@ -83,6 +119,7 @@ python syshealth.py
 - [ ] JSON-Output-Option für Monitoring-Integration
 - [ ] Config-File für Schwellwerte
 - [ ] Optionale Benachrichtigungen (Mail/Webhook)
+- [ ] Time Machine: Mehrere Backups / Maschinen in einem Report
 
 ## Lizenz
 

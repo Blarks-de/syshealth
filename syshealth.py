@@ -29,6 +29,9 @@ import sys
 import os
 import json
 import re
+import plistlib
+import tempfile
+import urllib.parse
 from datetime import datetime, timedelta
 from typing import Tuple, List, Optional
 
@@ -37,6 +40,9 @@ try:
 except ImportError:
     print("[!] psutil fehlt. Bitte installieren: pip install psutil")
     sys.exit(1)
+
+__version__ = "0.5.0"
+__version_date__ = "30.05.2026"
 
 SYSTEM = platform.system().lower()
 IS_WINDOWS = SYSTEM == "windows"
@@ -1464,7 +1470,7 @@ def check_hardware():
                     print(f"       {l.strip()}")
         else:
             # Fallback: VRAM-Größe aus /sys/class/drm
-            for card in sorted(os.listdir("/sys/class/drm")):
+            for card in sorted(os.listdir("/sys/class/drm")) if os.path.isdir("/sys/class/drm") else []:
                 if not re.match(r"^card\d+$", card):
                     continue
                 vendor_path = f"/sys/class/drm/{card}/device/vendor"
@@ -1705,12 +1711,440 @@ def check_timesync():
 
 
 # ─────────────────────────────────────────────
+# APPLE TIME MACHINE BACKUP CHECK
+# ─────────────────────────────────────────────
+
+def _tm_load_env() -> dict:
+    """
+    Liest TM_* Variablen aus .env (neben syshealth.py).
+    Erwartete Einträge:
+        TM_HOST=Dockfish          # Hostname oder IP des NAS
+        TM_SHARE=TimeMachine      # SMB-Freigabe-Name
+        TM_USER=backup            # SMB-Benutzer
+        TM_PASS=geheim            # SMB-Passwort
+        TM_MACHINE=MeinMacBook    # optional: Maschinenname-Filter
+    """
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    cfg = {}
+    if not os.path.exists(env_path):
+        return cfg
+    with open(env_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key = key.strip()
+            val = val.strip().strip('"').strip("'")
+            if key.startswith("TM_"):
+                cfg[key] = val
+    return cfg
+
+
+def _tm_format_age(delta: timedelta) -> str:
+    """timedelta → lesbarer deutscher String."""
+    secs = int(delta.total_seconds())
+    if secs < 0:
+        return "aus der Zukunft (?)"
+    if secs < 3600:
+        m = secs // 60
+        return f"{m} Minute{'n' if m != 1 else ''}"
+    if secs < 86400:
+        h = secs // 3600
+        return f"{h} Stunde{'n' if h != 1 else ''}"
+    d = secs // 86400
+    return f"{d} Tag{'e' if d != 1 else ''}"
+
+
+def _tm_format_dt(dt: datetime) -> str:
+    """datetime → '24. Mai 2026 14:00 Uhr'"""
+    months = ["", "Januar", "Februar", "März", "April", "Mai", "Juni",
+              "Juli", "August", "September", "Oktober", "November", "Dezember"]
+    return f"{dt.day}. {months[dt.month]} {dt.year} {dt.strftime('%H:%M')} Uhr"
+
+
+def _tm_via_tmutil() -> Optional[dict]:
+    """
+    macOS only: tmutil für direkten Status-Abruf (kein Mount nötig).
+    Gibt dict oder None zurück.
+    """
+    try:
+        raw    = subprocess.check_output(
+            ["tmutil", "status", "-X"], stderr=subprocess.DEVNULL, timeout=10
+        )
+        status = plistlib.loads(raw)
+    except Exception:
+        return None
+
+    result   = {"running": bool(status.get("Running", 0)),
+                "phase":   status.get("BackupPhase", "")}
+    progress = status.get("Progress", {})
+    if result["running"] and isinstance(progress, dict):
+        pct = progress.get("Percent", -1)
+        if isinstance(pct, (int, float)) and pct >= 0:
+            result["progress_pct"] = round(float(pct) * 100, 1)
+
+    # Letztes Backup-Datum via latestbackup
+    try:
+        latest = subprocess.check_output(
+            ["tmutil", "latestbackup"], stderr=subprocess.DEVNULL,
+            timeout=10, text=True
+        ).strip()
+        m = re.search(r"(\d{4}-\d{2}-\d{2})-(\d{6})$", latest)
+        if m:
+            result["last_backup"] = datetime.strptime(
+                f"{m.group(1)} {m.group(2)}", "%Y-%m-%d %H%M%S"
+            )
+            result["machine"] = os.path.basename(os.path.dirname(latest))
+    except Exception:
+        pass
+
+    # Destination-Name (NAS-Hostname)
+    try:
+        dest_raw = subprocess.check_output(
+            ["tmutil", "destinationinfo", "-X"],
+            stderr=subprocess.DEVNULL, timeout=5
+        )
+        dest_info = plistlib.loads(dest_raw)
+        dests = dest_info.get("Destinations", [dest_info])
+        if dests:
+            d = dests[0]
+            result["dest_name"] = d.get("Name", d.get("VolumeName", ""))
+    except Exception:
+        pass
+
+    return result
+
+
+def _tm_mount_smb(host: str, share: str, user: str, password: str,
+                  mount_point: str) -> Tuple[bool, str]:
+    """Mounted SMB-Share temporär. Gibt (Erfolg, Fehlermeldung) zurück."""
+    try:
+        if IS_MACOS:
+            pw_enc = urllib.parse.quote(password, safe="")
+            us_enc = urllib.parse.quote(user,     safe="")
+            cmd    = ["mount_smbfs",
+                      f"//{us_enc}:{pw_enc}@{host}/{share}",
+                      mount_point]
+        elif IS_LINUX:
+            # Benötigt: sudo apt install cifs-utils
+            cmd = [
+                "mount", "-t", "cifs",
+                f"//{host}/{share}", mount_point,
+                "-o", (f"username={user},password={password},"
+                       f"uid={os.getuid()},nobrl,vers=3.0,sec=ntlmssp")
+            ]
+        else:
+            return False, "Plattform nicht unterstützt"
+
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        if r.returncode == 0:
+            return True, ""
+        return False, (r.stderr or r.stdout or "Mount fehlgeschlagen").strip()
+    except subprocess.TimeoutExpired:
+        return False, f"Timeout beim Verbinden mit //{host}/{share}"
+    except Exception as e:
+        return False, str(e)
+
+
+def _tm_parse_share(mount_point: str, machine_filter: str = "") -> dict:
+    """
+    Analysiert einen gemounteten TM-Share.
+    Unterstützt .sparsebundle (Netzwerk) und Backups.backupdb (älteres Format).
+    """
+    result = {}
+    try:
+        entries = os.listdir(mount_point)
+    except PermissionError:
+        return {"error": "Kein Lesezugriff auf den Share"}
+
+    # ── .sparsebundle (modernes Netzwerk-Backup) ──────────────
+    bundles = [e for e in entries if e.endswith(".sparsebundle")]
+    if machine_filter:
+        filtered = [b for b in bundles if machine_filter.lower() in b.lower()]
+        if filtered:
+            bundles = filtered
+
+    if bundles:
+        bundle_path = os.path.join(mount_point, bundles[0])
+        result["type"]    = "sparsebundle"
+        result["machine"] = bundles[0].replace(".sparsebundle", "")
+
+        # Läuft gerade?
+        try:
+            bents = os.listdir(bundle_path)
+            result["running"] = (
+                any(e.endswith(".inProgress") for e in bents) or
+                os.path.exists(os.path.join(bundle_path, ".inProgress"))
+            )
+        except Exception:
+            result["running"] = False
+
+        # Results.plist → letztes Datum + Exit-Code
+        results_plist = os.path.join(
+            bundle_path, "com.apple.TimeMachine.Results.plist"
+        )
+        if os.path.exists(results_plist):
+            try:
+                with open(results_plist, "rb") as f:
+                    data = plistlib.load(f)
+                dates = data.get("SnapshotDates", [])
+                if dates:
+                    result["last_backup"] = max(
+                        d if isinstance(d, datetime)
+                        else datetime.fromisoformat(str(d))
+                        for d in dates
+                    )
+                exit_code = data.get("com.apple.backupd.BackupExit",
+                            data.get("Result", None))
+                result["backup_ok"] = exit_code in (0, "0", "Success", "success",
+                                                     None)
+            except Exception:
+                pass
+
+        # Fallback: mtime des Bundles
+        if "last_backup" not in result:
+            try:
+                mtime = os.path.getmtime(bundle_path)
+                result["last_backup"]        = datetime.fromtimestamp(mtime)
+                result["last_backup_approx"] = True
+                result["backup_ok"]          = True
+            except Exception:
+                pass
+        return result
+
+    # ── Backups.backupdb (älteres Format) ────────────────────
+    if "Backups.backupdb" in entries:
+        db_path  = os.path.join(mount_point, "Backups.backupdb")
+        result["type"] = "backupdb"
+        try:
+            machines = [m for m in os.listdir(db_path) if not m.startswith(".")]
+            if machine_filter:
+                filtered = [m for m in machines
+                            if machine_filter.lower() in m.lower()]
+                if filtered:
+                    machines = filtered
+            if machines:
+                result["machine"] = machines[0]
+                snaps = sorted([s for s in os.listdir(
+                    os.path.join(db_path, machines[0])
+                ) if not s.startswith(".")])
+                if snaps:
+                    last = snaps[-1]
+                    result["running"] = last.endswith(".inProgress")
+                    try:
+                        result["last_backup"] = datetime.strptime(
+                            last.replace(".inProgress", ""), "%Y-%m-%d-%H%M%S"
+                        )
+                        result["backup_ok"] = True
+                    except ValueError:
+                        pass
+        except Exception as e:
+            result["error"] = str(e)
+        return result
+
+    return {}
+
+
+def _tm_check_cifs_utils() -> bool:
+    """Prüft ob cifs-utils auf Linux installiert ist."""
+    rc, _, _ = run(["mount.cifs", "--version"])
+    if rc >= 0:
+        return True
+    # Alternativ: Im PATH suchen
+    return any(
+        os.path.exists(os.path.join(p, "mount.cifs"))
+        for p in os.environ.get("PATH", "").split(":")
+    )
+
+
+def check_timemachine():
+    """Time Machine Backup-Status über SMB prüfen."""
+    header("🍎  Apple Time Machine Backup")
+
+    cfg = _tm_load_env()
+
+    # Nicht konfiguriert → still überspringen
+    if not cfg:
+        print("  (nicht konfiguriert — .env mit TM_HOST/TM_SHARE/TM_USER/TM_PASS anlegen)")
+        return
+
+    # Unvollständige Konfiguration
+    required = ["TM_HOST", "TM_SHARE", "TM_USER", "TM_PASS"]
+    missing  = [k for k in required if k not in cfg]
+    if missing:
+        print(f"  ⚠️   .env unvollständig — fehlt: {', '.join(missing)}")
+        return
+
+    host    = cfg["TM_HOST"]
+    share   = cfg["TM_SHARE"]
+    user    = cfg["TM_USER"]
+    password= cfg["TM_PASS"]
+    machine = cfg.get("TM_MACHINE", "")
+
+    # ── macOS: tmutil zuerst (kein Mount, kein Root nötig) ───
+    if IS_MACOS:
+        tm = _tm_via_tmutil()
+        if tm is not None:
+            dest = tm.get("dest_name", host) or host
+            if tm["running"]:
+                phase = tm.get("phase", "")
+                pct   = tm.get("progress_pct", -1)
+                phase_str = f"  [{phase}]" if phase else ""
+                pct_str   = f"  —  {pct}%" if pct >= 0 else ""
+                print(f"  Status     : 🔄  Backup läuft gerade{phase_str}{pct_str}")
+                print(f"  Ziel       : //{dest}")
+                return
+            if "last_backup" in tm:
+                dt   = tm["last_backup"]
+                age  = datetime.now() - dt
+                mname = tm.get("machine", dest)
+                print(f"  Status     : ✅  Intakt")
+                print(f"  Letztes    : {_tm_format_dt(dt)}  ({_tm_format_age(age)} alt)")
+                print(f"  Maschine   : {mname}")
+                print(f"  Ziel       : //{dest}")
+                return
+            print(f"  Status     : ⚠️   tmutil: kein Datum lesbar (noch nie gesichert?)")
+            return
+
+    # ── Linux: cifs-utils prüfen ─────────────────────────────
+    if IS_LINUX and not _tm_check_cifs_utils():
+        print(f"  ❌  cifs-utils nicht installiert — SMB-Mount nicht möglich.")
+        print(f"      Bitte installieren:")
+        print(f"        Debian/Ubuntu :  sudo apt install cifs-utils")
+        print(f"        Fedora/RHEL   :  sudo dnf install cifs-utils")
+        print(f"        Arch          :  sudo pacman -S cifs-utils")
+        return
+
+    # ── SMB-Mount + Analyse ───────────────────────────────────
+    mount_point = tempfile.mkdtemp(prefix="syshealth_tm_")
+    mounted     = False
+
+    try:
+        print(f"  Verbinde   : //{host}/{share} …", end="", flush=True)
+        ok, err = _tm_mount_smb(host, share, user, password, mount_point)
+
+        if not ok:
+            print(f"\r  Status     : ❌  //{host}/{share} nicht erreichbar")
+            print(f"  Fehler     : {err}")
+            return
+
+        mounted     = True
+        print(f"\r  Verbinde   : //{host}/{share}  ✓        ")
+
+        backup_info = _tm_parse_share(mount_point, machine)
+
+        if not backup_info:
+            print(f"  Status     : ⚠️   Kein TM-Backup auf //{host}/{share} gefunden")
+            return
+
+        if "error" in backup_info:
+            print(f"  Status     : ❌  Lesefehler: {backup_info['error']}")
+            return
+
+        mname   = backup_info.get("machine", host)
+        btype   = backup_info.get("type", "")
+        approx  = backup_info.get("last_backup_approx", False)
+
+        if backup_info.get("running"):
+            print(f"  Status     : 🔄  Backup läuft gerade")
+            print(f"  Maschine   : {mname}")
+            return
+
+        if "last_backup" in backup_info:
+            dt      = backup_info["last_backup"]
+            age     = datetime.now() - dt
+            ok_flag = backup_info.get("backup_ok", True)
+            approx_hint = "  (Datum ca.)" if approx else ""
+
+            if ok_flag:
+                print(f"  Status     : ✅  Intakt")
+            else:
+                print(f"  Status     : ⚠️   Letzter Backup FEHLGESCHLAGEN")
+
+            print(f"  Letztes    : {_tm_format_dt(dt)}{approx_hint}  ({_tm_format_age(age)} alt)")
+            print(f"  Maschine   : {mname}")
+            print(f"  Format     : {btype}")
+            print(f"  Ziel       : //{host}/{share}")
+        else:
+            print(f"  Status     : ⚠️   Backup gefunden, aber kein Datum lesbar")
+            print(f"  Maschine   : {mname}")
+
+    except Exception as e:
+        print(f"\n  Status     : ❌  Unerwarteter Fehler: {e}")
+    finally:
+        if mounted:
+            subprocess.run(["umount", mount_point],
+                           capture_output=True, timeout=10)
+        try:
+            os.rmdir(mount_point)
+        except Exception:
+            pass
+
+
+# ─────────────────────────────────────────────
+# .GITIGNORE SICHERHEITSCHECK
+# ─────────────────────────────────────────────
+
+def check_gitignore_safety():
+    """
+    Warnt wenn .env nicht in .gitignore eingetragen ist.
+    Läuft nur wenn ein .git-Verzeichnis vorhanden ist (also wir in einem Repo sind).
+    """
+    script_dir  = os.path.dirname(os.path.abspath(__file__))
+    git_dir     = os.path.join(script_dir, ".git")
+    env_file    = os.path.join(script_dir, ".env")
+    gitignore   = os.path.join(script_dir, ".gitignore")
+
+    # Kein Repo → irrelevant
+    if not os.path.isdir(git_dir):
+        return
+
+    # .env existiert nicht → nichts zu schützen
+    if not os.path.exists(env_file):
+        return
+
+    # .gitignore existiert nicht
+    if not os.path.exists(gitignore):
+        print(f"\n{'!'*60}")
+        print(f"  🚨  SICHERHEITSWARNUNG")
+        print(f"{'!'*60}")
+        print(f"  .env gefunden, aber KEINE .gitignore!")
+        print(f"  Dein NAS-Passwort könnte ins Repo gepusht werden.")
+        print(f"  Fix:  echo '.env' >> .gitignore")
+        print(f"{'!'*60}")
+        return
+
+    # .gitignore vorhanden, aber .env nicht drin
+    with open(gitignore, "r") as f:
+        lines = [l.strip() for l in f.readlines()]
+
+    # Typische Muster die .env abdecken: ".env", "*.env", ".env*"
+    covered = any(
+        pat in lines
+        for pat in [".env", "*.env", ".env*", "**/.env"]
+    )
+
+    if not covered:
+        print(f"\n{'!'*60}")
+        print(f"  🚨  SICHERHEITSWARNUNG")
+        print(f"{'!'*60}")
+        print(f"  .env existiert, ist aber NICHT in .gitignore!")
+        print(f"  Dein NAS-Passwort könnte ins Repo gepusht werden.")
+        print(f"  Fix:  echo '.env' >> .gitignore")
+        print(f"{'!'*60}")
+
+
+# ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
 def main():
     print(f"\n{'═'*60}")
-    print(f"  SYSTEM HEALTH CHECK — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  SYSTEM HEALTH CHECK v{__version__} vom {__version_date__} — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'═'*60}")
+
+    # .gitignore Sicherheitscheck (zuerst, damit Warnung nicht untergeht)
+    check_gitignore_safety()
 
     # Root-Warnung
     if IS_LINUX and os.geteuid() != 0:
@@ -1728,6 +2162,7 @@ def main():
     check_docker()
     check_storage_extras()
     check_crypto()
+    check_timemachine()
 
     print(f"\n{'═'*60}")
     print(f"  Check abgeschlossen.")
