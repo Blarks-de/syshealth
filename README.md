@@ -11,6 +11,7 @@ Ein umfassendes System-Monitoring-Tool für Linux, Windows und macOS.
 - **CPU & Temperaturen**: Load, Core-Temps, CPU-Info
 - **Festplattenplatz**: Freier Speicher, Mount-Points
 - **Docker**: Container-Status und Images (falls installiert)
+- **Boot-Gerät & Multiboot**: Zeigt, von welcher Partition das aktuelle OS bootet, und listet weitere gefundene Betriebssysteme (Windows, andere Linux-Distros) auf
 - **Hardware-Info**: Netzwerkkarten, GPUs (NVIDIA/AMD/Apple Silicon)
 - **Hardware-Alter**: Produktionsdatum aus Serial Number (macOS) — wann wurde dein Mac gebaut?
 - **Verschlüsselung**: LUKS-Status und BitLocker (Windows)
@@ -95,6 +96,8 @@ python syshealth.py
 - **Dirty Pages**: Warnung bei ungeschriebenem Cache (>2% RAM)
 - **VM-Erkennung**: systemd-detect-virt, DMI, Hypervisor-Flags, Kernel-Module
 - **GPU-Details**: NVIDIA (nvidia-smi), AMD (rocm-smi), Intel
+- **Boot-Gerät**: Root-Partition via `findmnt` / `/proc/mounts`
+- **Multiboot-Erkennung**: `os-prober` bevorzugt; Fallback via `lsblk` (NTFS → Windows, benannte Linux-Partitionen → Linux). Kein Root, kein Schreiben erforderlich.
 
 ### Windows-Spezifisch
 - **BitLocker-Status**: Verschlüsselte Laufwerke
@@ -143,6 +146,6 @@ Dieses Projekt ist zu 100% AI-generierter Code, entstanden durch Prompt-Engineer
 
 - **Prompt:** "Build me a system health monitoring tool for Linux and Windows"
 - **Claude:** *cracks knuckles* "Hold my tokens..."
-- **Result:** 1400+ lines of production-ready Python
+- **Result:** 1500+ lines of production-ready Python
 
 No Stack Overflow copy-paste. No trial-and-error debugging sessions at 3 AM. Just conversational programming. Welcome to 2025.

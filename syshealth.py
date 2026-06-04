@@ -41,8 +41,8 @@ except ImportError:
     print("[!] psutil fehlt. Bitte installieren: pip install psutil")
     sys.exit(1)
 
-__version__ = "0.5.0"
-__version_date__ = "30.05.2026"
+__version__ = "0.6.0"
+__version_date__ = "04.06.2026"
 
 SYSTEM = platform.system().lower()
 IS_WINDOWS = SYSTEM == "windows"
@@ -984,6 +984,102 @@ def get_os_install_date() -> str:
     return "unbekannt"
 
 
+def _get_root_device() -> str:
+    """Returns the block device path of the root filesystem."""
+    rc, out, _ = run(["findmnt", "-n", "-o", "SOURCE", "/"])
+    if rc == 0 and out.strip():
+        return out.strip()
+    try:
+        with open("/proc/mounts") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2 and parts[1] == "/":
+                    return parts[0]
+    except OSError:
+        pass
+    return ""
+
+
+def _scan_other_oses_lsblk(root_dev: str) -> List[str]:
+    """Fallback: detect other OSes by scanning partition types via lsblk."""
+    rc, out, _ = run(["lsblk", "-J", "-o", "NAME,TYPE,FSTYPE,LABEL,PARTLABEL,MOUNTPOINT"])
+    if rc != 0 or not out.strip():
+        return []
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        return []
+
+    skip_label = re.compile(
+        r"^(EFI|ESP|boot|BOOT|swap|SWAP|MSR|Recovery|recovery|DIAG|reserved)$", re.I
+    )
+    win_fs   = {"ntfs", "ntfs3"}
+    linux_fs = {"ext4", "ext3", "ext2", "btrfs", "xfs", "f2fs"}
+
+    results: List[str] = []
+
+    def walk(devices: list) -> None:
+        for dev in devices:
+            dtype = dev.get("type", "")
+            name  = dev.get("name", "")
+            dev_path   = f"/dev/{name}"
+            fstype     = dev.get("fstype") or ""
+            label      = dev.get("label") or ""
+            partlabel  = dev.get("partlabel") or ""
+            mountpoint = dev.get("mountpoint") or ""
+
+            if dtype in ("part", "lvm"):
+                is_root = (mountpoint == "/") or (dev_path == root_dev)
+                skip_mp = mountpoint in ("/boot", "/efi", "/boot/efi", "[SWAP]")
+                if not is_root and not skip_mp:
+                    display = label or partlabel
+                    if fstype in win_fs:
+                        if display and not skip_label.match(display):
+                            results.append(f"Windows ({display}) (on {dev_path})")
+                        else:
+                            results.append(f"Windows (on {dev_path})")
+                    elif fstype in linux_fs:
+                        if display and not skip_label.match(display):
+                            results.append(f"Linux ({display}) (on {dev_path})")
+                        elif not display and not mountpoint:
+                            # Unlabeled, unmounted Linux filesystem — likely another OS root
+                            results.append(f"Linux (on {dev_path})")
+
+            if "children" in dev:
+                walk(dev["children"])
+
+    walk(data.get("blockdevices", []))
+    return results
+
+
+def get_boot_and_other_oses() -> Tuple[str, List[str]]:
+    """Detect the boot device and other installed OSes. Linux-only."""
+    if not IS_LINUX:
+        return "", []
+
+    root_dev = _get_root_device()
+    boot_os  = f"Linux (on {root_dev})" if root_dev else "Linux"
+
+    # Prefer os-prober — it mounts and reads /etc/os-release on each partition
+    other_oses: List[str] = []
+    rc, out, _ = run(["os-prober"])
+    if rc == 0 and out.strip():
+        for line in out.strip().splitlines():
+            # Format: /dev/sda1:Windows 11:Windows:chain
+            parts = line.split(":")
+            if len(parts) >= 2:
+                dev  = parts[0].strip()
+                name = parts[1].strip()
+                if dev and name:
+                    other_oses.append(f"{name} (on {dev})")
+
+    # Fallback: classify by filesystem type
+    if not other_oses:
+        other_oses = _scan_other_oses_lsblk(root_dev)
+
+    return boot_os, other_oses
+
+
 def check_system_info():
     header("ℹ️  System")
 
@@ -1011,7 +1107,9 @@ def check_system_info():
                     continue
                 shown_ips.append(f"{iface}: {ip}")
     if shown_ips:
-        print(f"  IP        : {' | '.join(shown_ips)}")
+        print(f"  IP        : {shown_ips[0]}")
+        for _ip in shown_ips[1:]:
+            print(f"              {_ip}")
 
     # OS-Version — Windows detailliert, Linux normal, macOS mit sw_vers
     if IS_WINDOWS:
@@ -1040,6 +1138,14 @@ def check_system_info():
         except OSError:
             pass
         print(f"  OS        : {platform.system()} {platform.release()}")
+
+    boot_os, other_oses = get_boot_and_other_oses()
+    if boot_os:
+        print(f"  Boot-OS   : {boot_os}")
+    if other_oses:
+        print(f"  Sonstige OS: {', '.join(other_oses)}")
+    else:
+        print(f"  Sonstige OS: keine gefunden")
 
     print(f"  Architektur: {platform.machine()}")
     print(f"  Python    : {platform.python_version()}")
