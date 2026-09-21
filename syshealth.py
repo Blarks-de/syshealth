@@ -23,6 +23,8 @@ Abhängigkeiten:
     - osx-cpu-temp (optional, für CPU-Temperaturen: brew install osx-cpu-temp)
 """
 
+import argparse
+import shutil
 import subprocess
 import platform
 import sys
@@ -41,8 +43,8 @@ except ImportError:
     print("[!] psutil fehlt. Bitte installieren: pip install psutil")
     sys.exit(1)
 
-__version__ = "0.6.0"
-__version_date__ = "04.06.2026"
+__version__ = "0.7.0"
+__version_date__ = "21.09.2026"
 
 SYSTEM = platform.system().lower()
 IS_WINDOWS = SYSTEM == "windows"
@@ -1080,8 +1082,306 @@ def get_boot_and_other_oses() -> Tuple[str, List[str]]:
     return boot_os, other_oses
 
 
-def check_system_info():
+# ─────────────────────────────────────────────
+# LOGO-ANZEIGE (fastfetch-artig, nur Stdlib)
+# ─────────────────────────────────────────────
+# Farbmarker in der ASCII-Art: $1..$4 schalten auf die Farbe aus "colors" des
+# jeweiligen Logos um, $0 setzt zurück. Die Art ist reines ASCII (kein
+# Encoding-Risiko) und enthält sonst kein "$". Die Zeilen werden beim Abruf
+# auf gleiche Breite aufgefüllt (get_platform_logo).
+LOGO_GAP = 2  # Leerzeichen zwischen Logo und Info-Text
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+_LOGO_MARKER_RE = re.compile(r"\$[0-9]")
+
+LOGOS = {
+    "raspberry": {
+        "colors": {"1": "32", "2": "31"},  # grün, rot
+        "art": r"""
+$1    .~~.   .~~.
+$1   '. \ ' ' / .'
+$2    .~ .~~~..~.
+$2   : .~.'~'.~. :
+$2  ~ (   ) (   ) ~
+$2 ( : '~'.~.'~' : )
+$2  ~ .~ (   ) ~. ~
+$2   (  : '~' :  )
+$2    '~ .~~~. ~'
+$2        '~'
+""",
+    },
+    "apple": {
+        "colors": {"1": "32", "2": "33", "3": "31", "4": "34"},  # grün, gelb, rot, blau
+        "art": r"""
+$1       .:'
+$1    _ :'_
+$2 .'`_`-'_``.
+$2:________.-'
+$3:_______:
+$3:_______:
+$4 :_________`-;
+$4  `.__.-.__.'
+""",
+    },
+    "windows": {
+        "colors": {"1": "34"},  # blau
+        "art": r"""
+$1########  ########
+$1########  ########
+$1########  ########
+$1########  ########
+
+$1########  ########
+$1########  ########
+$1########  ########
+$1########  ########
+""",
+    },
+    "wsl": {
+        "colors": {"1": "34", "2": "33"},  # blau, gelb
+        "art": r"""
+$1########  ########
+$1########  ########
+$1########  ########
+$1########  ########
+
+$1########  ########
+$1########  ########
+$1########  ########
+$1########  ########
+$2      W S L
+""",
+    },
+    "tux": {
+        "colors": {"1": "33", "2": "37"},  # gelb, weiß
+        "art": r"""
+$2    .--.
+$2   |$1o_o $2|
+$2   |$1:_/ $2|
+$2  //   \ \
+$2 (|     | )
+$1/'\_   _/`\
+$1\___)=(___/
+""",
+    },
+    "debian": {
+        "colors": {"1": "31"},  # rot
+        "art": r"""
+$1  _____
+$1 /  __ \
+$1|  /    |
+$1|  \___-
+$1-_
+$1  --_
+""",
+    },
+    "ubuntu": {
+        "colors": {"1": "31", "2": "37"},  # rot, weiß
+        "art": r"""
+$1         $2_
+$1     ---$2(_)
+$1 _/  ---  \
+$2(_)$1 |   |
+$1  \  --- _/
+$1     ---$2(_)
+""",
+    },
+    "arch": {
+        "colors": {"1": "36"},  # cyan
+        "art": r"""
+$1      /\
+$1     /  \
+$1    /\   \
+$1   /      \
+$1  /   ,,   \
+$1 /   |  |  -\
+$1/_-''    ''-_\
+""",
+    },
+    "fedora": {
+        "colors": {"1": "34"},  # blau
+        "art": r"""
+$1        ,'''''.
+$1       |   ,.  |
+$1       |  |  '_'
+$1  ,....|  |..
+$1.'  ,_;|   ..'
+$1|  |   |  |
+$1|  ',_,'  |
+$1 '.     ,'
+$1   '''''
+""",
+    },
+    "cachyos": {
+        "colors": {"1": "32", "2": "36"},  # grün, cyan
+        "art": r"""
+$1   /''''''''''''/
+$1  /''''''/
+$1 /''''''/
+$2 \......\
+$2  \......\
+$2   \.............\
+$2    \____________\
+""",
+    },
+}
+
+# /etc/os-release ID → Logo-Schlüssel (alles andere: Tux)
+_DISTRO_LOGOS = {
+    "debian": "debian",
+    "ubuntu": "ubuntu",
+    "arch": "arch",
+    "fedora": "fedora",
+    "cachyos": "cachyos",
+}
+
+
+def _read_text(path: str) -> str:
+    """Liest eine kleine Textdatei (z.B. aus /proc); leer bei jedem Fehler.
+    NUL-Bytes werden entfernt (/proc/device-tree/model endet damit)."""
+    try:
+        with open(path, "rb") as f:
+            return f.read(4096).decode("utf-8", errors="ignore").replace("\x00", "")
+    except OSError:
+        return ""
+
+
+def _read_os_release_id() -> str:
+    """Liest ID= aus /etc/os-release (Fallback /usr/lib/os-release), kleingeschrieben."""
+    content = _read_text("/etc/os-release") or _read_text("/usr/lib/os-release")
+    for line in content.splitlines():
+        if line.startswith("ID="):
+            return line[3:].strip().strip('"\'').lower()
+    return ""
+
+
+def detect_platform() -> str:
+    """Gibt den Logo-Schlüssel (Key in LOGOS) der erkannten Plattform zurück.
+    Reihenfolge unter Linux: Raspberry Pi → WSL → Distribution → Tux."""
+    system = platform.system()
+    if system == "Darwin":
+        return "apple"
+    if system == "Windows":
+        return "windows"
+    if system == "Linux":
+        if "raspberry pi" in _read_text("/proc/device-tree/model").lower():
+            return "raspberry"
+        # WSL muss vor dem generischen Linux geprüft werden (Kernel heißt "…-microsoft-standard-WSL2")
+        if ("microsoft" in platform.uname().release.lower()
+                or "microsoft" in _read_text("/proc/version").lower()):
+            return "wsl"
+        return _DISTRO_LOGOS.get(_read_os_release_id(), "tux")
+    return "tux"
+
+
+def _visible_len(text: str) -> int:
+    """Länge ohne ANSI-Farbcodes."""
+    return len(_ANSI_RE.sub("", text))
+
+
+def get_platform_logo(key: Optional[str] = None, color: bool = True) -> List[str]:
+    """Logo als Liste gleich breiter Zeilen. key=None → erkannte Plattform.
+    color=False liefert reinen Text ohne ANSI-Codes."""
+    logo = LOGOS.get(key or detect_platform(), LOGOS["tux"])
+    art = logo["art"].strip("\n").splitlines()
+    width = max(len(_LOGO_MARKER_RE.sub("", line)) for line in art)
+    lines = []
+    for line in art:
+        line = line + " " * (width - len(_LOGO_MARKER_RE.sub("", line)))
+        if color:
+            line = _LOGO_MARKER_RE.sub(
+                lambda m: "\033[0m" if m.group()[1] == "0"
+                else f"\033[1;{logo['colors'][m.group()[1]]}m", line) + "\033[0m"
+        else:
+            line = _LOGO_MARKER_RE.sub("", line)
+        lines.append(line)
+    return lines
+
+
+def _enable_windows_ansi() -> bool:
+    """Schaltet ANSI/VT-Verarbeitung der Windows-Konsole ein. False, wenn nicht möglich."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GetStdHandle.restype = wintypes.HANDLE
+        kernel32.GetConsoleMode.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel32.SetConsoleMode.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        mode = wintypes.DWORD()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False  # keine Konsole (Umleitung o.ä.)
+        vt = 0x0004  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        return bool(mode.value & vt) or bool(kernel32.SetConsoleMode(handle, mode.value | vt))
+    except Exception:
+        return False
+
+
+def logo_enabled(show_logo: bool = True) -> bool:
+    """Darf ein farbiges Logo ausgegeben werden? (Flag, TTY, NO_COLOR, TERM, Windows-ANSI)"""
+    if not show_logo:
+        return False
+    try:
+        if not sys.stdout.isatty():
+            return False
+    except (AttributeError, ValueError):
+        return False
+    if os.environ.get("NO_COLOR"):  # https://no-color.org: gesetzt und nicht leer
+        return False
+    if os.environ.get("TERM", "").lower() == "dumb":
+        return False
+    if IS_WINDOWS and not _enable_windows_ansi():
+        return False
+    return True
+
+
+def compose_with_logo(info_lines: List[str], logo_lines: List[str], columns: int) -> Optional[List[str]]:
+    """Setzt Logo (links) und Info-Zeilen (rechts) zeilenweise zusammen.
+    Gibt None zurück, wenn das Ergebnis breiter als `columns` wäre."""
+    logo_w = max(_visible_len(line) for line in logo_lines)
+    info_w = max((_visible_len(line) for line in info_lines), default=0)
+    if logo_w + LOGO_GAP + info_w > columns:
+        return None
+    gap = " " * LOGO_GAP
+    blank = " " * logo_w
+    out = []
+    for i in range(max(len(info_lines), len(logo_lines))):
+        left = logo_lines[i] if i < len(logo_lines) else blank
+        right = info_lines[i] if i < len(info_lines) else ""
+        out.append(f"{left}{gap}{right}" if right else left)
+    return out
+
+
+def print_with_logo(info_lines: List[str], show_logo: bool = True) -> None:
+    """Gibt info_lines aus — wenn möglich mit dem Plattform-Logo links daneben.
+    Bei jedem Problem (kein TTY, NO_COLOR, zu schmal, Encoding, Fehler) wird
+    unverändert ohne Logo ausgegeben."""
+    composed = None
+    try:
+        if logo_enabled(show_logo):
+            logo = get_platform_logo()
+            "\n".join(logo).encode(sys.stdout.encoding or "ascii")  # Konsole muss das Logo darstellen können
+            columns = shutil.get_terminal_size(fallback=(80, 24)).columns
+            composed = compose_with_logo(info_lines, logo, columns)
+    except Exception:
+        composed = None
+    for line in (composed if composed is not None else info_lines):
+        print(line)
+
+
+def show_logo_demo() -> None:
+    """Debug: zeigt alle Logos nacheinander (farbig nur bei TTY/ohne NO_COLOR)."""
+    color = logo_enabled(True)
+    print(f"Erkannte Plattform: {detect_platform()}")
+    for key in LOGOS:
+        print(f"\n[{key}]")
+        for line in get_platform_logo(key, color=color):
+            print(f"  {line}")
+    print()
+
+
+def check_system_info(show_logo: bool = True):
     header("ℹ️  System")
+    info = []  # Zeilen des Info-Blocks; Ausgabe am Ende (ggf. mit Logo daneben)
 
     boot = datetime.fromtimestamp(psutil.boot_time())
     uptime = datetime.now() - boot
@@ -1089,7 +1389,7 @@ def check_system_info():
     hours, rem = divmod(uptime.seconds, 3600)
     minutes = rem // 60
 
-    print(f"  Hostname  : {platform.node()}")
+    info.append(f"  Hostname  : {platform.node()}")
 
     # Lokale IPs — virtuelle/Container-Interfaces rausfiltern
     skip_patterns = re.compile(
@@ -1107,13 +1407,13 @@ def check_system_info():
                     continue
                 shown_ips.append(f"{iface}: {ip}")
     if shown_ips:
-        print(f"  IP        : {shown_ips[0]}")
+        info.append(f"  IP        : {shown_ips[0]}")
         for _ip in shown_ips[1:]:
-            print(f"              {_ip}")
+            info.append(f"              {_ip}")
 
     # OS-Version — Windows detailliert, Linux normal, macOS mit sw_vers
     if IS_WINDOWS:
-        print(f"  OS        : {get_windows_version()}")
+        info.append(f"  OS        : {get_windows_version()}")
     elif IS_MACOS:
         rc, out, _ = run(["sw_vers"])
         if rc == 0:
@@ -1126,9 +1426,9 @@ def check_system_info():
             prod_name = version_info.get("ProductName", "macOS")
             prod_ver = version_info.get("ProductVersion", "")
             build = version_info.get("BuildVersion", "")
-            print(f"  OS        : {prod_name} {prod_ver} (Build: {build})")
+            info.append(f"  OS        : {prod_name} {prod_ver} (Build: {build})")
         else:
-            print(f"  OS        : macOS (sw_vers nicht verfügbar)")
+            info.append(f"  OS        : macOS (sw_vers nicht verfügbar)")
     else:
         cpu_model_os = ""
         try:
@@ -1137,28 +1437,30 @@ def check_system_info():
                 pass
         except OSError:
             pass
-        print(f"  OS        : {platform.system()} {platform.release()}")
+        info.append(f"  OS        : {platform.system()} {platform.release()}")
 
     boot_os, other_oses = get_boot_and_other_oses()
     if boot_os:
-        print(f"  Boot-OS   : {boot_os}")
+        info.append(f"  Boot-OS   : {boot_os}")
     if other_oses:
-        print(f"  Sonstige OS: {', '.join(other_oses)}")
+        info.append(f"  Sonstige OS: {', '.join(other_oses)}")
     else:
-        print(f"  Sonstige OS: keine gefunden")
+        info.append(f"  Sonstige OS: keine gefunden")
 
-    print(f"  Architektur: {platform.machine()}")
-    print(f"  Python    : {platform.python_version()}")
-    print(f"  Installiert: {get_os_install_date()}")
+    info.append(f"  Architektur: {platform.machine()}")
+    info.append(f"  Python    : {platform.python_version()}")
+    info.append(f"  Installiert: {get_os_install_date()}")
     
     # Hardware-Alter (nur macOS)
     if IS_MACOS:
         hw_age = get_hardware_age()
         if hw_age:
-            print(f"  Hardware  : {hw_age}")
+            info.append(f"  Hardware  : {hw_age}")
     
-    print(f"  Boot-Zeit : {boot.strftime('%Y-%m-%d %H:%M')}")
-    print(f"  Uptime    : {days}d {hours}h {minutes}m")
+    info.append(f"  Boot-Zeit : {boot.strftime('%Y-%m-%d %H:%M')}")
+    info.append(f"  Uptime    : {days}d {hours}h {minutes}m")
+
+    print_with_logo(info, show_logo)
 
 
 # ─────────────────────────────────────────────
@@ -2244,7 +2546,23 @@ def check_gitignore_safety():
 # ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
-def main():
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="syshealth.py — System-Gesundheitscheck für Linux, Windows und macOS"
+    )
+    parser.add_argument("--nologo", action="store_true",
+                        help="kein Plattform-Logo neben dem System-Block anzeigen")
+    parser.add_argument("--logo-demo", action="store_true",
+                        help="alle Logos nacheinander anzeigen und beenden (Debug)")
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    if args.logo_demo:
+        show_logo_demo()
+        return
+
     print(f"\n{'═'*60}")
     print(f"  SYSTEM HEALTH CHECK v{__version__} vom {__version_date__} — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'═'*60}")
@@ -2257,7 +2575,7 @@ def main():
         print("\n  ⚠️  Nicht als root — SMART/NVMe-Abfragen könnten scheitern.")
         print("       Empfohlen: sudo python3 syshealth.py\n")
 
-    check_system_info()
+    check_system_info(show_logo=not args.nologo)
     check_timesync()
     check_vm()
     check_ram()

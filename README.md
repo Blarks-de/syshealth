@@ -18,6 +18,7 @@ Ein umfassendes System-Monitoring-Tool für Linux, Windows und macOS.
 - **Zeitabgleich**: NTP-Offset, Zeitzone, Sync-Status
 - **Apple Time Machine**: Backup-Status über SMB-Share — wann war das letzte Backup, läuft es gerade, ist es intakt?
 - **Sicherheitscheck**: Warnt automatisch wenn `.env` nicht im `.gitignore` steht
+- **Plattform-Logo**: Farbiges ASCII-Logo (Raspberry Pi, WSL, macOS, Windows, Debian, Ubuntu, Arch, Fedora, CachyOS, sonst Tux) neben dem System-Block, wie bei fastfetch
 
 ## Installation
 
@@ -82,6 +83,36 @@ sudo python3 syshealth.py
 # Windows (als Administrator in PowerShell)
 python syshealth.py
 ```
+
+Optionen:
+
+| Option | Wirkung |
+|---|---|
+| `--nologo` | Kein Plattform-Logo neben dem System-Block |
+| `--logo-demo` | Zeigt alle Logos nacheinander und beendet sich (zum Beurteilen/Debuggen) |
+
+## Logo-Anzeige
+
+Links neben den Zeilen des System-Blocks steht ein farbiges ASCII-Logo der erkannten Plattform. Nur Stdlib, keine zusätzlichen Abhängigkeiten. Die übrige Ausgabe bleibt unverändert.
+
+Erkennung (`detect_platform()`), in dieser Reihenfolge:
+
+1. macOS (`platform.system() == "Darwin"`) → Apple-Logo
+2. Windows → Windows-Logo
+3. Linux: `Raspberry Pi` in `/proc/device-tree/model` → Raspberry-Pi-Logo
+4. Linux: `microsoft` (ohne Groß-/Kleinschreibung) in Kernel-Release oder `/proc/version` → WSL-Logo (vor dem generischen Linux geprüft)
+5. Linux: `ID` aus `/etc/os-release` → Debian, Ubuntu, Arch, Fedora oder CachyOS
+6. sonst → Tux
+
+Das Logo entfällt automatisch (ohne Fehler, Ausgabe wie sonst), wenn
+
+- `--nologo` gesetzt ist,
+- die Ausgabe kein Terminal ist (Pipe, Datei, Cron),
+- `NO_COLOR` gesetzt (nicht leer) ist oder `TERM=dumb`,
+- das Terminal zu schmal für Logo + Info-Zeilen ist (`shutil.get_terminal_size`),
+- unter Windows die Konsole keine ANSI-Sequenzen zulässt.
+
+Eigene Logos lassen sich im Dict `LOGOS` ergänzen (Farbmarker `$1`–`$4` in der Art, Farben pro Logo unter `colors`).
 
 ## Features im Detail
 
