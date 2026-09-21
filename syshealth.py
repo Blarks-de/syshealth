@@ -43,7 +43,7 @@ except ImportError:
     print("[!] psutil fehlt. Bitte installieren: pip install psutil")
     sys.exit(1)
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 __version_date__ = "21.09.2026"
 
 SYSTEM = platform.system().lower()
@@ -797,6 +797,21 @@ def get_windows_version() -> str:
         return f"{platform.system()} {platform.release()} {platform.version()}"
 
 
+def get_linux_distro_name() -> str:
+    """Liest den Distributions-Namen aus /etc/os-release (z.B. 'Debian GNU/Linux 13 (trixie)')."""
+    try:
+        info = {}
+        with open("/etc/os-release") as f:
+            for line in f:
+                line = line.strip()
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    info[k] = v.strip('"')
+        return info.get("PRETTY_NAME") or info.get("NAME", "")
+    except OSError:
+        return ""
+
+
 def get_hardware_age() -> str:
     """Ermittelt das Hardware-Alter (nur macOS via Serial Number)."""
     if not IS_MACOS:
@@ -1438,6 +1453,9 @@ def check_system_info(show_logo: bool = True):
         except OSError:
             pass
         info.append(f"  OS        : {platform.system()} {platform.release()}")
+        distro = get_linux_distro_name()
+        if distro:
+            info.append(f"  Distribution: {distro}")
 
     boot_os, other_oses = get_boot_and_other_oses()
     if boot_os:
@@ -1472,6 +1490,7 @@ def check_disk_space():
     # Lokale Partitionen
     partitions = psutil.disk_partitions(all=False)
     printed = set()
+    devices_by_mountpoint: dict = {}
     for p in partitions:
         try:
             usage = psutil.disk_usage(p.mountpoint)
@@ -1482,6 +1501,7 @@ def check_disk_space():
         if key in printed:
             continue
         printed.add(key)
+        devices_by_mountpoint.setdefault(p.mountpoint, []).append(p.device)
 
         pct = usage.percent
         status = "✅" if pct < 80 else ("⚠️ " if pct < 92 else "❌")
@@ -1490,6 +1510,13 @@ def check_disk_space():
 
         print(f"  {p.mountpoint:<22} {pct:5.1f}% voll  "
               f"({free_gb:.1f} GB frei / {total_gb:.1f} GB)  {status}")
+
+    # Warnung bei mehreren Geräten auf demselben Mountpoint (gestapelte Mounts
+    # verdecken das eigentlich darunterliegende Dateisystem)
+    for mountpoint, devices in devices_by_mountpoint.items():
+        if len(devices) > 1:
+            print(f"  ⚠️  {mountpoint} hat mehrere Geräte gemountet ({', '.join(devices)})"
+                  f" — das unterste Dateisystem ist verdeckt! Prüfen mit: findmnt {mountpoint}")
 
     # Windows: Netzlaufwerke via PowerShell / net use
     if IS_WINDOWS:

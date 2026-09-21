@@ -125,8 +125,10 @@ Eigene Logos lassen sich im Dict `LOGOS` ergänzen (Farbmarker `$1`–`$4` in de
 
 ### Linux-Spezifisch
 - **Dirty Pages**: Warnung bei ungeschriebenem Cache (>2% RAM)
+- **Gestapelte Mounts**: Warnung bei mehreren Geräten auf demselben Mountpoint (das untere Dateisystem ist dann verdeckt), inkl. Hinweis auf `findmnt <pfad>`
 - **VM-Erkennung**: systemd-detect-virt, DMI, Hypervisor-Flags, Kernel-Module
 - **GPU-Details**: NVIDIA (nvidia-smi), AMD (rocm-smi), Intel
+- **Distribution**: Eigene Zeile `Distribution:` unter `OS` (`PRETTY_NAME` aus `/etc/os-release`, z. B. `Debian GNU/Linux 13 (trixie)`)
 - **Boot-Gerät**: Root-Partition via `findmnt` / `/proc/mounts`
 - **Multiboot-Erkennung**: `os-prober` bevorzugt; Fallback via `lsblk` (NTFS → Windows, benannte Linux-Partitionen → Linux). Kein Root, kein Schreiben erforderlich.
 
